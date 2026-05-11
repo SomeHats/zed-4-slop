@@ -10,9 +10,11 @@
 
 use crate::{
     AnyView, AnyWindowHandle, App, AppCell, AppContext, AssetSource, BackgroundExecutor, Bounds,
-    Context, Entity, EntityId, ForegroundExecutor, Global, Pixels, PlatformHeadlessRenderer,
-    PlatformTextSystem, Render, Reservation, Size, Task, TestDispatcher, TestPlatform, TextSystem,
-    Window, WindowBounds, WindowHandle, WindowOptions,
+    Capslock, Context, Entity, EntityId, ForegroundExecutor, Global, InputEvent, Keystroke,
+    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, PlatformHeadlessRenderer, PlatformTextSystem, Point, Render, Reservation, Size, Task,
+    TestDispatcher, TestPlatform, TestWindow, TextSystem, Window, WindowBounds, WindowHandle,
+    WindowOptions,
     app::{GpuiBorrow, GpuiMode},
 };
 use anyhow::Result;
@@ -168,6 +170,161 @@ impl HeadlessAppContext {
     pub fn capture_screenshot(&mut self, window: AnyWindowHandle) -> Result<RgbaImage> {
         let mut app = self.app.borrow_mut();
         app.update_window(window, |_, window, _| window.render_to_image())?
+    }
+
+    /// Returns the rendered bounds of an element tagged with
+    /// `.debug_selector(|| "name".into())`. Mirrors
+    /// [`crate::VisualTestContext::debug_bounds`] for tests driving
+    /// `HeadlessAppContext` directly (pixel-snapshot tests, etc.).
+    ///
+    /// Only populated after the window has rendered at least one frame
+    /// containing the tagged element. Returns `None` if the selector is
+    /// unknown.
+    pub fn debug_bounds(
+        &mut self,
+        window: AnyWindowHandle,
+        selector: &str,
+    ) -> Option<Bounds<Pixels>> {
+        let mut app = self.app.borrow_mut();
+        app.update_window(window, |_, window, _| {
+            window.rendered_frame.debug_bounds.get(selector).copied()
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Returns the `TestWindow` backing the given handle. Useful for tests
+    /// that need to dispatch raw `PlatformInput` directly; most callers
+    /// should prefer the typed `simulate_*` helpers below.
+    pub fn test_window(&self, window: AnyWindowHandle) -> TestWindow {
+        self.app
+            .borrow_mut()
+            .windows
+            .get_mut(window.id)
+            .unwrap()
+            .as_deref_mut()
+            .unwrap()
+            .platform_window
+            .as_test()
+            .unwrap()
+            .clone()
+    }
+
+    /// Simulates a platform input event arriving at the window. Drives the
+    /// background executor to quiescence afterwards so observers and
+    /// dispatched listeners get a chance to run.
+    pub fn simulate_event<E: InputEvent>(&mut self, window: AnyWindowHandle, event: E) {
+        self.test_window(window)
+            .simulate_input(event.to_platform_input());
+        self.background_executor.run_until_parked();
+    }
+
+    /// Simulates a mouse-move event to the given window-relative position.
+    pub fn simulate_mouse_move(
+        &mut self,
+        window: AnyWindowHandle,
+        position: Point<Pixels>,
+        button: impl Into<Option<MouseButton>>,
+        modifiers: Modifiers,
+    ) {
+        self.simulate_event(
+            window,
+            MouseMoveEvent {
+                position,
+                modifiers,
+                pressed_button: button.into(),
+            },
+        );
+    }
+
+    /// Simulates a mouse-down event at the given position.
+    pub fn simulate_mouse_down(
+        &mut self,
+        window: AnyWindowHandle,
+        position: Point<Pixels>,
+        button: MouseButton,
+        modifiers: Modifiers,
+    ) {
+        self.simulate_event(
+            window,
+            MouseDownEvent {
+                position,
+                modifiers,
+                button,
+                click_count: 1,
+                first_mouse: false,
+            },
+        );
+    }
+
+    /// Simulates a mouse-up event at the given position.
+    pub fn simulate_mouse_up(
+        &mut self,
+        window: AnyWindowHandle,
+        position: Point<Pixels>,
+        button: MouseButton,
+        modifiers: Modifiers,
+    ) {
+        self.simulate_event(
+            window,
+            MouseUpEvent {
+                position,
+                modifiers,
+                button,
+                click_count: 1,
+            },
+        );
+    }
+
+    /// Simulates a primary mouse click (down + up) at the given position.
+    pub fn simulate_click(
+        &mut self,
+        window: AnyWindowHandle,
+        position: Point<Pixels>,
+        modifiers: Modifiers,
+    ) {
+        self.simulate_mouse_down(window, position, MouseButton::Left, modifiers);
+        self.simulate_mouse_up(window, position, MouseButton::Left, modifiers);
+    }
+
+    /// Simulates a modifiers-changed event (e.g. user pressed Shift).
+    pub fn simulate_modifiers_change(
+        &mut self,
+        window: AnyWindowHandle,
+        modifiers: Modifiers,
+    ) {
+        self.simulate_event(
+            window,
+            ModifiersChangedEvent {
+                modifiers,
+                capslock: Capslock { on: false },
+            },
+        );
+    }
+
+    /// Dispatches a single keystroke through the window's keymap.
+    pub fn dispatch_keystroke(&mut self, window: AnyWindowHandle, keystroke: Keystroke) {
+        self.update_window(window, |_, window, cx| {
+            window.dispatch_keystroke(keystroke, cx);
+        })
+        .unwrap();
+    }
+
+    /// Parses and dispatches a space-separated list of keystrokes
+    /// (e.g. `"cmd-shift-p enter"`).
+    pub fn simulate_keystrokes(&mut self, window: AnyWindowHandle, keystrokes: &str) {
+        for keystroke in keystrokes.split(' ').map(Keystroke::parse).map(Result::unwrap) {
+            self.dispatch_keystroke(window, keystroke);
+        }
+        self.background_executor.run_until_parked();
+    }
+
+    /// Types a string of text into the focused element, one character at a time.
+    pub fn simulate_input(&mut self, window: AnyWindowHandle, input: &str) {
+        for keystroke in input.split("").map(Keystroke::parse).map(Result::unwrap) {
+            self.dispatch_keystroke(window, keystroke);
+        }
+        self.background_executor.run_until_parked();
     }
 
     /// Returns the text system.
