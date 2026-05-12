@@ -2048,6 +2048,20 @@ impl Window {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
     }
 
+    /// Drains and runs every callback queued via [`Window::on_next_frame`].
+    /// In production these run inside the platform's frame-request closure,
+    /// which the OS frame loop drives. Headless tests have no such loop, so
+    /// widgets relying on `on_next_frame` (PopoverMenu focus deferral,
+    /// modal transitions, etc.) won't make progress without an explicit
+    /// tick. Callers loop this method themselves when they need to settle
+    /// chained `on_next_frame` calls.
+    pub fn flush_next_frame_callbacks(&mut self, cx: &mut App) {
+        let callbacks = self.next_frame_callbacks.take();
+        for callback in callbacks {
+            callback(self, cx);
+        }
+    }
+
     /// Schedule a frame to be drawn on the next animation frame.
     ///
     /// This is useful for elements that need to animate continuously, such as a video player or an animated GIF.

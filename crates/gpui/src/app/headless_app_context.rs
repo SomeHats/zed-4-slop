@@ -163,6 +163,22 @@ impl HeadlessAppContext {
         app.update_window(window, f)
     }
 
+    /// Drains and runs every callback queued via
+    /// [`Window::on_next_frame`] on the given window — one frame's worth
+    /// of deferred work. Production code runs these inside the platform's
+    /// frame-request closure, which the OS frame loop drives; headless
+    /// tests need to call this explicitly to advance widgets that defer
+    /// focus / transitions to the next frame.
+    ///
+    /// Single-tick by design — chain calls yourself when a callback
+    /// schedules more callbacks (e.g. PopoverMenu's two-frame focus
+    /// deferral).
+    pub fn flush_next_frame_callbacks(&mut self, window: AnyWindowHandle) {
+        let _ = self.update_window(window, |_, window, cx| {
+            window.flush_next_frame_callbacks(cx);
+        });
+    }
+
     /// Captures a screenshot from a window.
     ///
     /// Requires that the context was created with a renderer factory that
