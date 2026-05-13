@@ -425,13 +425,19 @@ impl TextLayout {
 
                 let (truncate_width, truncation_affix, truncate_from) =
                     if let Some(text_overflow) = text_style.text_overflow.clone() {
-                        let width = known_dimensions.width.or(match available_space.width {
-                            crate::AvailableSpace::Definite(x) => match text_style.line_clamp {
-                                Some(max_lines) => Some(x * max_lines),
-                                None => Some(x),
-                            },
-                            _ => None,
-                        });
+                        // For multi-line clamps, the wrap-aware path further
+                        // down handles truncation precisely. For single-line
+                        // (no `line_clamp`, or `line_clamp(1)`), the legacy
+                        // linear-budget approach is exactly right.
+                        let needs_wrap_aware = matches!(text_style.line_clamp, Some(n) if n >= 2);
+                        let width = if needs_wrap_aware {
+                            None
+                        } else {
+                            known_dimensions.width.or(match available_space.width {
+                                crate::AvailableSpace::Definite(x) => Some(x),
+                                _ => None,
+                            })
+                        };
 
                         match text_overflow {
                             TextOverflow::Truncate(s) => (width, s, TruncateFrom::End),
@@ -454,8 +460,47 @@ impl TextLayout {
                     return size;
                 }
 
+                // Wrap-aware multi-line truncation. Used when both
+                // `text_overflow` and `line_clamp(N >= 2)` are set: the
+                // legacy linear `truncate_line` budget (`wrap_width × N`)
+                // overestimates capacity once word wrapping leaves slack
+                // at line ends, and the appended ellipsis can land on a
+                // line that `line_clamp` then clips. `truncate_text_for_wrap`
+                // shapes once to find every wrap boundary, then truncates
+                // inside the Nth visible row so the affix stays inside
+                // `wrap_width`.
+                let needs_wrap_aware = matches!(text_style.line_clamp, Some(n) if n >= 2)
+                    && !truncation_affix.is_empty();
+                let wrap_aware_text = if needs_wrap_aware {
+                    let wrap_width_for_truncation = known_dimensions
+                        .width
+                        .or(match available_space.width {
+                            crate::AvailableSpace::Definite(x) => Some(x),
+                            _ => None,
+                        });
+                    wrap_width_for_truncation.and_then(|wrap_w| {
+                        window
+                            .text_system()
+                            .truncate_text_for_wrap(
+                                text.clone(),
+                                font_size,
+                                &runs,
+                                wrap_w,
+                                text_style.line_clamp.unwrap(),
+                                &truncation_affix,
+                            )
+                            .log_err()
+                    })
+                } else {
+                    None
+                };
+
                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
-                let (text, runs) = if let Some(truncate_width) = truncate_width {
+                let (text, runs) = if let Some((wrap_aware_text, wrap_aware_runs)) =
+                    wrap_aware_text
+                {
+                    (wrap_aware_text, wrap_aware_runs)
+                } else if let Some(truncate_width) = truncate_width {
                     line_wrapper.truncate_line(
                         text.clone(),
                         truncate_width,

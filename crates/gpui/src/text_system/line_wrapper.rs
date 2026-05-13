@@ -272,7 +272,7 @@ impl LineWrapper {
     }
 }
 
-fn update_runs_after_truncation(
+pub(crate) fn update_runs_after_truncation(
     result: &str,
     ellipsis: &str,
     runs: &mut Vec<TextRun>,
