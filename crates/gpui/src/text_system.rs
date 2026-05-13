@@ -644,6 +644,110 @@ impl WindowTextSystem {
         self.line_layout_cache.finish_frame()
     }
 
+    /// Truncate `text` so that, when subsequently shaped at `wrap_width` with
+    /// `line_clamp(max_lines)`, it occupies at most `max_lines` visual rows
+    /// AND ends with `affix` (typically `"…"`).
+    ///
+    /// Why this exists: pairing `text_overflow` with `line_clamp` on the
+    /// same element used to take a linear `wrap_width × max_lines` budget,
+    /// truncate the source string to that many pixels of glyph width, and
+    /// then word-wrap. Word boundaries leave slack at line ends, so the
+    /// resulting text frequently needs `max_lines + 1` wrapped lines —
+    /// `line_clamp` then silently clipped the trailing line including the
+    /// appended ellipsis. This helper instead shapes the full text first
+    /// to find every wrap boundary, walks visual rows until `max_lines` is
+    /// reached, and only then truncates within the `max_lines`-th visible
+    /// row so the ellipsis lands inside `wrap_width`.
+    ///
+    /// Returns the original `text` and `runs` (borrowed) when no truncation
+    /// is needed. Currently only `TruncateFrom::End` is supported.
+    pub fn truncate_text_for_wrap<'a>(
+        self: &Arc<Self>,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &'a [TextRun],
+        wrap_width: Pixels,
+        max_lines: usize,
+        affix: &str,
+    ) -> Result<(SharedString, Cow<'a, [TextRun]>)> {
+        if max_lines == 0 || text.is_empty() {
+            return Ok((text, Cow::Borrowed(runs)));
+        }
+
+        // Shape WITHOUT line_clamp so every wrap boundary is visible.
+        let lines = self.shape_text(text.clone(), font_size, runs, Some(wrap_width), None)?;
+
+        let mut consumed_input_bytes: usize = 0;
+        let mut consumed_visual_rows: usize = 0;
+
+        for (input_line_ix, wrapped) in lines.iter().enumerate() {
+            let visual_rows = wrapped.layout.wrap_boundaries.len() + 1;
+            if consumed_visual_rows + visual_rows <= max_lines {
+                consumed_visual_rows += visual_rows;
+                consumed_input_bytes += wrapped.layout.len();
+                if input_line_ix + 1 < lines.len() {
+                    consumed_input_bytes += '\n'.len_utf8();
+                }
+                continue;
+            }
+
+            // The (max_lines)-th visible row falls inside this input line.
+            // Indices below are 0-based within this input line's visual rows.
+            let last_visible_row_ix = max_lines - consumed_visual_rows - 1;
+
+            let row_start_byte_in_line = if last_visible_row_ix == 0 {
+                0
+            } else {
+                wrap_boundary_byte_offset(
+                    &wrapped.layout.unwrapped_layout,
+                    wrapped.layout.wrap_boundaries[last_visible_row_ix - 1],
+                )
+            };
+            let next_row_start_byte_in_line = wrapped
+                .layout
+                .wrap_boundaries
+                .get(last_visible_row_ix)
+                .map(|b| wrap_boundary_byte_offset(&wrapped.layout.unwrapped_layout, *b))
+                .unwrap_or(wrapped.layout.len());
+
+            // Find a truncation index *within the last visible row* such that
+            // `<row_text>[..ix] + affix` fits in `wrap_width`. The wrapper
+            // walks chars one at a time tracking glyph width — same primitive
+            // the legacy `truncate_line` path uses, just on a single row.
+            let row_text_start = consumed_input_bytes + row_start_byte_in_line;
+            let row_text_end = consumed_input_bytes + next_row_start_byte_in_line;
+            let row_text = &text[row_text_start..row_text_end];
+            let font = runs
+                .first()
+                .map(|r| r.font.clone())
+                .unwrap_or_default();
+            let mut wrapper = self.line_wrapper(font, font_size);
+            let truncate_ix_in_row = wrapper
+                .should_truncate_line(row_text, wrap_width, affix, TruncateFrom::End)
+                .unwrap_or(row_text.len());
+            // Snap to a char boundary (should_truncate_line returns one, but
+            // be defensive against future refactors).
+            let truncate_ix_in_row =
+                row_text.floor_char_boundary(truncate_ix_in_row.min(row_text.len()));
+
+            let abs_cut_byte = row_text_start + truncate_ix_in_row;
+            // Trim trailing whitespace so we don't end up with "word …" —
+            // the space-then-ellipsis reads as a typo more than a cue.
+            let prefix = text[..abs_cut_byte].trim_end();
+            let mut truncated = String::with_capacity(prefix.len() + affix.len());
+            truncated.push_str(prefix);
+            truncated.push_str(affix);
+
+            let mut new_runs = runs.to_vec();
+            update_runs_after_truncation(&truncated, affix, &mut new_runs, TruncateFrom::End);
+
+            return Ok((SharedString::from(truncated), Cow::Owned(new_runs)));
+        }
+
+        // Text fits within `max_lines` — no truncation needed.
+        Ok((text, Cow::Borrowed(runs)))
+    }
+
     /// Layout the given line of text, at the given font_size.
     /// Subsets of the line can be styled independently with the `runs` parameter.
     /// Generally, you should prefer to use [`Self::shape_line`] instead, which
@@ -1172,6 +1276,19 @@ pub fn font_name_with_fallbacks<'a>(name: &'a str, system: &'a str) -> &'a str {
     }
 }
 
+/// Resolve a `WrapBoundary` (a `(run_ix, glyph_ix)` pair) to a byte offset
+/// inside the underlying input line. The boundary points at the glyph that
+/// *starts* the next wrapped row, and each `ShapedGlyph` carries its source
+/// byte index.
+fn wrap_boundary_byte_offset(layout: &LineLayout, boundary: WrapBoundary) -> usize {
+    layout
+        .runs
+        .get(boundary.run_ix)
+        .and_then(|run| run.glyphs.get(boundary.glyph_ix))
+        .map(|glyph| glyph.index)
+        .unwrap_or(layout.len)
+}
+
 /// Like [`font_name_with_fallbacks`] but accepts and returns [`SharedString`] references.
 #[allow(unused)]
 pub fn font_name_with_fallbacks_shared<'a>(
@@ -1188,3 +1305,172 @@ pub fn font_name_with_fallbacks_shared<'a>(
         _ => name,
     }
 }
+
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod tests {
+    use super::*;
+    use crate::{Font, TestAppContext, font};
+
+    fn font_run(font: Font, len: usize) -> TextRun {
+        TextRun {
+            len,
+            font,
+            color: Default::default(),
+            background_color: None,
+            underline: Default::default(),
+            strikethrough: None,
+        }
+    }
+
+    fn count_visual_rows(lines: &[WrappedLine]) -> usize {
+        lines
+            .iter()
+            .map(|l| l.layout.wrap_boundaries.len() + 1)
+            .sum()
+    }
+
+    /// A string that wraps to 4 visible lines at `wrap_width` must, after
+    /// truncation, fit in exactly `max_lines` (=2) visual rows AND end
+    /// with the `…` affix. Both invariants would fail under the legacy
+    /// `wrap_width × max_lines` linear-budget approach because the
+    /// truncated string usually still needed a 3rd wrapped line, which
+    /// `line_clamp(2)` would clip — silently dropping the ellipsis.
+    #[crate::test]
+    fn truncate_text_for_wrap_keeps_ellipsis_visible(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
+
+            let text = SharedString::from(
+                "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda \
+                 mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega",
+            );
+            let mono = font(".ZedMono");
+            let runs = vec![font_run(mono.clone(), text.len())];
+            let font_size = px(14.0);
+            let wrap_width = px(140.0);
+            let max_lines = 2;
+            let affix = "…";
+
+            let (truncated, truncated_runs) = text_system
+                .truncate_text_for_wrap(
+                    text.clone(),
+                    font_size,
+                    &runs,
+                    wrap_width,
+                    max_lines,
+                    affix,
+                )
+                .expect("truncate");
+
+            assert_ne!(
+                truncated.as_ref(),
+                text.as_ref(),
+                "long text must actually be truncated"
+            );
+            assert!(
+                truncated.ends_with(affix),
+                "truncated text should end with the affix; got {truncated:?}"
+            );
+            // No trailing whitespace immediately before the affix — `"word …"`
+            // reads as a typo. The truncation point can land just past a
+            // space if the next word didn't fit; trim before appending.
+            let body = &truncated[..truncated.len() - affix.len()];
+            assert!(
+                !body.ends_with(char::is_whitespace),
+                "truncated text must not have whitespace before the affix; got {truncated:?}"
+            );
+
+            // Re-shape with line_clamp(2) — the renderer pipeline. The
+            // visual row count must not exceed max_lines.
+            let shaped = text_system
+                .shape_text(
+                    truncated.clone(),
+                    font_size,
+                    &truncated_runs,
+                    Some(wrap_width),
+                    Some(max_lines),
+                )
+                .expect("shape");
+            let visual_rows = count_visual_rows(&shaped);
+            assert!(
+                visual_rows <= max_lines,
+                "shaped output must fit in max_lines={max_lines} visual rows; \
+                 got {visual_rows} for {truncated:?}",
+            );
+
+            // Most importantly: the affix must survive the shape step. If
+            // the truncated string still wraps past max_lines, line_clamp
+            // would clip the trailing line containing the affix. Walk the
+            // shaped lines and confirm every byte of `truncated` is
+            // accounted for (including the affix at the end).
+            let mut bytes_consumed = 0usize;
+            for (line_ix, line) in shaped.iter().enumerate() {
+                bytes_consumed += line.layout.len();
+                if line_ix + 1 < shaped.len() {
+                    bytes_consumed += '\n'.len_utf8();
+                }
+            }
+            assert_eq!(
+                bytes_consumed,
+                truncated.len(),
+                "every byte of the truncated string (including the affix) \
+                 should fit within the shaped output; got {bytes_consumed} \
+                 of {} for {truncated:?}",
+                truncated.len(),
+            );
+        });
+    }
+
+    /// Short text — already fits inside `max_lines` — must pass through
+    /// unchanged. Catches over-eager truncation regressions.
+    #[crate::test]
+    fn truncate_text_for_wrap_passes_short_text_through(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
+            let text: SharedString = "short".into();
+            let runs = vec![font_run(font(".ZedMono"), text.len())];
+            let (out, _) = text_system
+                .truncate_text_for_wrap(
+                    text.clone(),
+                    px(14.0),
+                    &runs,
+                    px(200.0),
+                    2,
+                    "…",
+                )
+                .expect("truncate");
+            assert_eq!(out.as_ref(), text.as_ref());
+        });
+    }
+
+    /// `max_lines == 1` matches the old single-line behaviour: text gets
+    /// truncated such that the single visible line plus `…` fits in
+    /// `wrap_width`.
+    #[crate::test]
+    fn truncate_text_for_wrap_handles_single_line_clamp(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
+            let text: SharedString =
+                "this is a fairly long line that will not fit in a narrow column".into();
+            let runs = vec![font_run(font(".ZedMono"), text.len())];
+            let wrap_width = px(120.0);
+            let (out, out_runs) = text_system
+                .truncate_text_for_wrap(text.clone(), px(14.0), &runs, wrap_width, 1, "…")
+                .expect("truncate");
+            assert!(out.ends_with('…'));
+            // Truncated text must shape to exactly one line.
+            let shaped = text_system
+                .shape_text(
+                    out.clone(),
+                    px(14.0),
+                    &out_runs,
+                    Some(wrap_width),
+                    Some(1),
+                )
+                .expect("shape");
+            assert_eq!(count_visual_rows(&shaped), 1);
+        });
+    }
+}
+
